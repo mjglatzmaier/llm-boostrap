@@ -7,6 +7,52 @@ set -euo pipefail
 ENV_NAME="hf-llm-bench"
 
 # ---------------------------------------------------------------------------
+# Make conda available in this non-interactive shell.
+# `bash setup.sh` does not source ~/.bashrc, so conda is not on PATH by
+# default. We locate the installation and source its shell hook explicitly.
+# ---------------------------------------------------------------------------
+_init_conda() {
+    # 1. Already on PATH — nothing to do.
+    if command -v conda &>/dev/null; then
+        return 0
+    fi
+
+    # 2. Try common install locations.
+    local candidates=(
+        "$HOME/miniconda3"
+        "$HOME/anaconda3"
+        "$HOME/miniconda"
+        "$HOME/anaconda"
+        "/opt/conda"
+        "/usr/local/conda"
+    )
+    for base in "${candidates[@]}"; do
+        if [ -f "${base}/etc/profile.d/conda.sh" ]; then
+            # shellcheck source=/dev/null
+            source "${base}/etc/profile.d/conda.sh"
+            return 0
+        fi
+    done
+
+    # 3. Allow the caller to pass CONDA_ROOT explicitly.
+    if [ -n "${CONDA_ROOT:-}" ] && [ -f "${CONDA_ROOT}/etc/profile.d/conda.sh" ]; then
+        source "${CONDA_ROOT}/etc/profile.d/conda.sh"
+        return 0
+    fi
+
+    echo "Error: conda not found on PATH and no known install location was detected."
+    echo ""
+    echo "  Option A — run from a shell where conda is already active:"
+    echo "    conda activate base && bash setup.sh"
+    echo ""
+    echo "  Option B — pass your conda root explicitly:"
+    echo "    CONDA_ROOT=/path/to/miniconda3 bash setup.sh"
+    exit 1
+}
+
+_init_conda
+
+# ---------------------------------------------------------------------------
 # Detect the appropriate PyTorch CUDA wheel tag from nvidia-smi
 # ---------------------------------------------------------------------------
 detect_cuda_tag() {
