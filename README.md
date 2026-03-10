@@ -1,4 +1,4 @@
-# hf-llm-bench
+# llm-bootstrap
 
 A lightweight, extensible framework for downloading and benchmarking Hugging Face
 language models on local hardware.
