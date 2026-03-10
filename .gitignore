@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtualenvs / conda (don't commit env dirs)
+.venv/
+venv/
+env/
+
+# Models and weights (often large — fetch separately)
+models/
+*.gguf
+*.bin
+*.safetensors
+*.pt
+*.pth
+
+# HF cache if someone puts it here
+.cache/
+
+# Env files
+.env
+*.env
+
+# macOS
+.DS_Store
+
+# Editor
+.vscode/
+.idea/
+*.swp

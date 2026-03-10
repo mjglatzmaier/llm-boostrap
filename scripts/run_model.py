@@ -1,14 +1,17 @@
-"""Run local inference with a Hugging Face causal LM and report benchmark metrics.
+"""Run a single inference pass with a Hugging Face causal LM.
+
+Streams output token-by-token and reports basic benchmark metrics:
 
 Metrics reported
 ----------------
-- Time to first token (TTFT)
+- Model load time
+- Time to first token (TTFT) — measured from generate() call to first streamed chunk
 - Total generation time
-- Prompt token count
-- Output token count
-- Throughput (tokens / second)
-- GPU memory: pre-generate, post-generate, peak allocated, reserved cache
-- GPU live stats (via pynvml): utilization, temperature, power draw
+- Prompt token count / output token count / throughput
+- GPU memory (pre-generate, post-generate, peak, reserved)
+- GPU live stats via pynvml (utilization, temperature, power) if installed
+
+For multi-run throughput averaging, use benchmark_inference.py instead.
 """
 
 import argparse
@@ -33,65 +36,98 @@ except ImportError:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run local inference with a Hugging Face causal LM.",
-        formatter_class=argparse.ArgumentDefaultsHelpFormatter,
+        description=(
+            "Run a single inference pass with a local Hugging Face causal LM\n"
+            "and report benchmark metrics (TTFT, throughput, GPU memory)."
+        ),
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=(
+            "Examples:\n"
+            "  # Load by model ID (uses HF cache):\n"
+            "  python scripts/run_model.py --model-id Qwen/Qwen2.5-0.5B-Instruct\n\n"
+            "  # Load from a local directory:\n"
+            "  python scripts/run_model.py --model-dir ./models/Qwen--Qwen2.5-0.5B-Instruct\n\n"
+            "  # Custom prompt, greedy decoding, bfloat16:\n"
+            "  python scripts/run_model.py \\\n"
+            "      --model-id Qwen/Qwen2.5-0.5B-Instruct \\\n"
+            "      --prompt 'What is backpropagation?' \\\n"
+            "      --greedy --dtype bfloat16\n"
+        ),
     )
-    parser.add_argument(
+    source = parser.add_mutually_exclusive_group()
+    source.add_argument(
         "--model-id",
-        type=str,
         default=None,
-        help="HF model ID (e.g. Qwen/Qwen2.5-0.5B-Instruct). Downloads if not cached.",
+        metavar="ID",
+        help="HF model ID (e.g. Qwen/Qwen2.5-0.5B-Instruct). Uses HF cache.",
     )
-    parser.add_argument(
+    source.add_argument(
         "--model-dir",
-        type=str,
         default=None,
-        help="Path to a local model snapshot directory (from fetch_model.py).",
+        metavar="PATH",
+        help=(
+            "Path to a local snapshot directory (e.g. from fetch_hf_model.py). "
+            "Load from the snapshot root, not from blobs/."
+        ),
     )
     parser.add_argument(
         "--prompt",
-        type=str,
         default="Write a haiku about local inference.",
         help="User prompt.",
     )
     parser.add_argument(
         "--system",
-        type=str,
         default="You are a concise and helpful assistant.",
-        help="System message.",
+        help="System message (used if the model has a chat template).",
     )
     parser.add_argument(
         "--max-new-tokens",
         type=int,
         default=256,
-        help="Maximum number of tokens to generate.",
+        help="Maximum tokens to generate.",
     )
     parser.add_argument(
         "--temperature",
         type=float,
         default=0.7,
-        help="Sampling temperature (ignored when do_sample=False).",
+        help="Sampling temperature (ignored when --greedy is set).",
     )
     parser.add_argument(
         "--top-p",
         type=float,
         default=0.9,
-        help="Top-p nucleus sampling probability.",
+        help="Nucleus sampling probability (ignored when --greedy is set).",
     )
     parser.add_argument(
         "--greedy",
         action="store_true",
-        help="Use greedy decoding instead of sampling.",
+        help="Use greedy decoding (deterministic output).",
+    )
+    parser.add_argument(
+        "--dtype",
+        choices=["auto", "float16", "bfloat16", "float32"],
+        default="auto",
+        help="Weight dtype. 'auto' lets transformers choose (usually bfloat16 on Ampere+).",
+    )
+    parser.add_argument(
+        "--device",
+        choices=["auto", "cuda", "cpu"],
+        default="auto",
+        help="Device to run on. 'auto' uses CUDA if available.",
     )
     parser.add_argument(
         "--local-only",
         action="store_true",
-        help="Require local files only; never make network requests.",
+        help="Never make network requests; model must already be cached locally.",
     )
     parser.add_argument(
-        "--cpu",
+        "--trust-remote-code",
         action="store_true",
-        help="Force CPU execution (disables CUDA even if available).",
+        default=False,
+        help=(
+            "Allow execution of custom modelling code from the model repo. "
+            "Only enable this for repos you trust."
+        ),
     )
     return parser.parse_args()
 
@@ -105,7 +141,11 @@ def resolve_model_source(model_id: Optional[str], model_dir: Optional[str]) -> s
         return model_dir
     if model_id:
         return model_id
-    raise ValueError("Provide --model-id or --model-dir.")
+    raise ValueError(
+        "Provide --model-id or --model-dir.\n"
+        "  --model-id  : HF model ID, loads from cache (fetch first with fetch_hf_model.py)\n"
+        "  --model-dir : path to a local snapshot directory"
+    )
 
 
 def fmt_gb(n_bytes: int) -> str:
@@ -138,6 +178,50 @@ def collect_gpu_stats(device_index: int = 0) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Error handling
+# ---------------------------------------------------------------------------
+
+def _handle_load_error(exc: Exception, model_source: str) -> None:
+    exc_str = str(exc)
+    print(f"\n✗ Failed to load model: {exc}")
+
+    if "no such file" in exc_str.lower() or "not a directory" in exc_str.lower():
+        print(
+            f"\n  '{model_source}' does not exist or is not a valid model directory.\n"
+            "  To download it:\n"
+            f"    python scripts/fetch_hf_model.py {model_source}\n"
+            "  Then load with:\n"
+            f"    python scripts/run_model.py --model-id {model_source}"
+        )
+    elif "local_files_only" in exc_str or "offline" in exc_str.lower():
+        print(
+            "\n  Model is not in the local cache. Either:\n"
+            "    - Remove --local-only to allow cache lookup\n"
+            f"    - Or fetch it first:  python scripts/fetch_hf_model.py {model_source}"
+        )
+    elif "out of memory" in exc_str.lower() or "oom" in exc_str.lower():
+        print(
+            "\n  Out of GPU memory. Try:\n"
+            "    - A smaller model variant (e.g. 0.5B or 1B)\n"
+            "    - Pass --dtype float16 to reduce memory usage\n"
+            "    - Pass --device cpu (slow, but no VRAM limit)"
+        )
+    elif "401" in exc_str or "gated" in exc_str.lower():
+        print(
+            "\n  This model is gated. You need an HF access token.\n"
+            "  Accept the license at https://huggingface.co/ then:\n"
+            f"    python scripts/fetch_hf_model.py {model_source} --token hf_..."
+        )
+    else:
+        print(
+            "\n  Troubleshooting:\n"
+            "    - Confirm the model ID or path is correct\n"
+            "    - Run: python scripts/check_gpu.py\n"
+            "    - Ensure the environment is active: conda activate hf-llm-bench"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
 
@@ -150,15 +234,32 @@ def main() -> int:
         print(f"Error: {exc}")
         return 1
 
-    use_cuda = torch.cuda.is_available() and not args.cpu
+    # Device selection
+    if args.device == "cpu":
+        use_cuda = False
+    elif args.device == "cuda":
+        if not torch.cuda.is_available():
+            print("Error: --device cuda requested but no CUDA device was found.")
+            print("  Run: python scripts/check_gpu.py")
+            return 1
+        use_cuda = True
+    else:
+        use_cuda = torch.cuda.is_available()
+
     device_map = "auto" if use_cuda else None
-    torch_dtype = "auto" if use_cuda else torch.float32
+    if args.dtype == "auto":
+        torch_dtype = "auto" if use_cuda else torch.float32
+    else:
+        torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[args.dtype]
     device_label = f"cuda:{torch.cuda.current_device()}" if use_cuda else "cpu"
 
     print(f"Model  : {model_source}")
     print(f"Device : {device_label}")
     if use_cuda:
         print(f"GPU    : {torch.cuda.get_device_name(0)}")
+        print(f"Dtype  : {args.dtype}")
+    if args.trust_remote_code:
+        print("Note   : trust_remote_code=True — only use with repos you trust")
 
     # ------------------------------------------------------------------
     # Load model + tokenizer
@@ -174,17 +275,17 @@ def main() -> int:
         tokenizer = AutoTokenizer.from_pretrained(
             model_source,
             local_files_only=args.local_only,
-            trust_remote_code=False,
+            trust_remote_code=args.trust_remote_code,
         )
         model = AutoModelForCausalLM.from_pretrained(
             model_source,
             local_files_only=args.local_only,
             torch_dtype=torch_dtype,
             device_map=device_map,
-            trust_remote_code=False,
+            trust_remote_code=args.trust_remote_code,
         )
     except Exception as exc:
-        print(f"\nFailed to load model: {exc}")
+        _handle_load_error(exc, model_source)
         return 1
 
     if not use_cuda:
